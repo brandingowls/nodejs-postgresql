@@ -207,10 +207,19 @@ class V8_EXPORT_PRIVATE Type {
   inline bool IsAny() const { return kind_ == Kind::kAny; }
   template <size_t B>
   inline bool IsWord() const {
+    static_assert(B == 32 || B == 64);
     if constexpr (B == 32)
       return IsWord32();
     else
       return IsWord64();
+  }
+  template <size_t B>
+  inline bool IsFloat() const {
+    static_assert(B == 32 || B == 64);
+    if constexpr (B == 32)
+      return IsFloat32();
+    else
+      return IsFloat64();
   }
 
   // Casts
@@ -221,10 +230,19 @@ class V8_EXPORT_PRIVATE Type {
   inline const TupleType& AsTuple() const;
   template <size_t B>
   inline const auto& AsWord() const {
+    static_assert(B == 32 || B == 64);
     if constexpr (B == 32)
       return AsWord32();
     else
       return AsWord64();
+  }
+  template <size_t B>
+  inline const auto& AsFloat() const {
+    static_assert(B == 32 || B == 64);
+    if constexpr (B == 32)
+      return AsFloat32();
+    else
+      return AsFloat64();
   }
 
   // Comparison
@@ -355,7 +373,7 @@ class EXPORT_TEMPLATE_DECLARE(V8_EXPORT_PRIVATE) WordType : public Type {
     return Set(base::Vector<const word_t>{elements.begin(), elements.size()},
                zone);
   }
-  static WordType Set(const base::Vector<const word_t>& elements, Zone* zone) {
+  static WordType Set(base::Vector<const word_t> elements, Zone* zone) {
     DCHECK(detail::is_unique_and_sorted(elements));
     DCHECK_IMPLIES(elements.size() > kMaxInlineSetSize, zone != nullptr);
     DCHECK_GT(elements.size(), 0);
@@ -371,7 +389,7 @@ class EXPORT_TEMPLATE_DECLARE(V8_EXPORT_PRIVATE) WordType : public Type {
     } else {
       // Allocate storage in the zone.
       Payload_OutlineSet p;
-      p.array = zone->NewArray<word_t>(elements.size());
+      p.array = zone->AllocateArray<word_t>(elements.size());
       DCHECK_NOT_NULL(p.array);
       for (size_t i = 0; i < elements.size(); ++i) p.array[i] = elements[i];
       return WordType{SubKind::kSet, static_cast<uint8_t>(elements.size()), p};
@@ -526,7 +544,7 @@ class EXPORT_TEMPLATE_DECLARE(V8_EXPORT_PRIVATE) FloatType : public Type {
     DCHECK(!detail::is_float_special_value(min));
     DCHECK(!detail::is_float_special_value(max));
     DCHECK_LE(min, max);
-    if (min == max) return Set({min}, zone);
+    if (min == max) return Set({min}, special_values, zone);
     return FloatType{SubKind::kRange, 0, special_values,
                      Payload_Range{min, max}};
   }
@@ -554,7 +572,7 @@ class EXPORT_TEMPLATE_DECLARE(V8_EXPORT_PRIVATE) FloatType : public Type {
     return Set(base::Vector<const float_t>{elements.data(), elements.size()},
                special_values, zone);
   }
-  static FloatType Set(const base::Vector<const float_t>& elements,
+  static FloatType Set(base::Vector<const float_t> elements,
                        uint32_t special_values, Zone* zone) {
     DCHECK(detail::is_unique_and_sorted(elements));
     // NaN should be passed via {special_values} rather than {elements}.
@@ -578,7 +596,7 @@ class EXPORT_TEMPLATE_DECLARE(V8_EXPORT_PRIVATE) FloatType : public Type {
     } else {
       // Allocate storage in the zone.
       Payload_OutlineSet p;
-      p.array = zone->NewArray<float_t>(elements.size());
+      p.array = zone->AllocateArray<float_t>(elements.size());
       DCHECK_NOT_NULL(p.array);
       for (size_t i = 0; i < elements.size(); ++i) {
         p.array[i] = elements[i];
@@ -746,8 +764,11 @@ class EXPORT_TEMPLATE_DECLARE(V8_EXPORT_PRIVATE) FloatType : public Type {
     }
     return Special::kNoSpecialValues;
   }
-  static FloatType ReplacedSpecialValues(const FloatType& t,
-                                         uint32_t special_values) {
+  static Type ReplacedSpecialValues(const FloatType& t,
+                                    uint32_t special_values) {
+    if (special_values == 0 && t.is_only_special_values()) {
+      return FloatType::None();
+    }
     auto result = t;
     result.bitfield_ = special_values;
     DCHECK_EQ(result.bitfield_, result.special_values());
@@ -778,17 +799,17 @@ class TupleType : public Type {
   static TupleType Tuple(const Type& element0, const Type& element1,
                          Zone* zone) {
     Payload p;
-    p.array = zone->NewArray<Type>(2);
+    p.array = zone->AllocateArray<Type>(2);
     DCHECK_NOT_NULL(p.array);
     p.array[0] = element0;
     p.array[1] = element1;
     return TupleType{2, p};
   }
 
-  static TupleType Tuple(const base::Vector<Type>& elements, Zone* zone) {
+  static TupleType Tuple(base::Vector<Type> elements, Zone* zone) {
     DCHECK_LE(elements.size(), kMaxTupleSize);
     Payload p;
-    p.array = zone->NewArray<Type>(elements.size());
+    p.array = zone->AllocateArray<Type>(elements.size());
     DCHECK_NOT_NULL(p.array);
     for (size_t i = 0; i < elements.size(); ++i) {
       p.array[i] = elements[i];
@@ -876,6 +897,10 @@ inline std::ostream& operator<<(std::ostream& stream, const Type& type) {
 
 inline bool operator==(const Type& lhs, const Type& rhs) {
   return lhs.Equals(rhs);
+}
+
+inline bool operator!=(const Type& lhs, const Type& rhs) {
+  return !lhs.Equals(rhs);
 }
 
 template <>

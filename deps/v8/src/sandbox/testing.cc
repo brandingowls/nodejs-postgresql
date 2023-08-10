@@ -29,25 +29,27 @@ namespace internal {
 namespace {
 
 // Sandbox.byteLength
-void SandboxGetByteLength(const v8::FunctionCallbackInfo<v8::Value>& args) {
-  v8::Isolate* isolate = args.GetIsolate();
+void SandboxGetByteLength(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  DCHECK(ValidateCallbackInfo(info));
+  v8::Isolate* isolate = info.GetIsolate();
   double sandbox_size = GetProcessWideSandbox()->size();
-  args.GetReturnValue().Set(v8::Number::New(isolate, sandbox_size));
+  info.GetReturnValue().Set(v8::Number::New(isolate, sandbox_size));
 }
 
-// new Sandbox.MemoryView(args) -> Sandbox.MemoryView
-void SandboxMemoryView(const v8::FunctionCallbackInfo<v8::Value>& args) {
-  v8::Isolate* isolate = args.GetIsolate();
+// new Sandbox.MemoryView(info) -> Sandbox.MemoryView
+void SandboxMemoryView(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  DCHECK(ValidateCallbackInfo(info));
+  v8::Isolate* isolate = info.GetIsolate();
   Local<v8::Context> context = isolate->GetCurrentContext();
 
-  if (!args.IsConstructCall()) {
+  if (!info.IsConstructCall()) {
     isolate->ThrowError("Sandbox.MemoryView must be invoked with 'new'");
     return;
   }
 
   Local<v8::Integer> arg1, arg2;
-  if (!args[0]->ToInteger(context).ToLocal(&arg1) ||
-      !args[1]->ToInteger(context).ToLocal(&arg2)) {
+  if (!info[0]->ToInteger(context).ToLocal(&arg1) ||
+      !info[1]->ToInteger(context).ToLocal(&arg2)) {
     isolate->ThrowError("Expects two number arguments (start offset and size)");
     return;
   }
@@ -73,48 +75,145 @@ void SandboxMemoryView(const v8::FunctionCallbackInfo<v8::Value>& args) {
     return;
   }
   Handle<JSArrayBuffer> buffer = factory->NewJSArrayBuffer(std::move(memory));
-  args.GetReturnValue().Set(Utils::ToLocal(buffer));
+  info.GetReturnValue().Set(Utils::ToLocal(buffer));
 }
 
-// Sandbox.getAddressOf(object) -> Number
-void SandboxGetAddressOf(const v8::FunctionCallbackInfo<v8::Value>& args) {
-  v8::Isolate* isolate = args.GetIsolate();
+// The methods below either take a HeapObject or the address of a HeapObject as
+// argument. These helper functions can be used to extract the argument object
+// in both cases.
+using ArgumentObjectExtractorFunction = std::function<bool(
+    const v8::FunctionCallbackInfo<v8::Value>&, Tagged<HeapObject>* out)>;
 
-  if (args.Length() == 0) {
+static bool GetArgumentObjectPassedAsReference(
+    const v8::FunctionCallbackInfo<v8::Value>& info, Tagged<HeapObject>* out) {
+  v8::Isolate* isolate = info.GetIsolate();
+
+  if (info.Length() == 0) {
     isolate->ThrowError("First argument must be provided");
-    return;
+    return false;
   }
 
-  Handle<Object> arg = Utils::OpenHandle(*args[0]);
-  if (!arg->IsHeapObject()) {
+  Handle<Object> arg = Utils::OpenHandle(*info[0]);
+  if (!IsHeapObject(*arg)) {
     isolate->ThrowError("First argument must be a HeapObject");
+    return false;
+  }
+
+  *out = HeapObject::cast(*arg);
+  return true;
+}
+
+static bool GetArgumentObjectPassedAsAddress(
+    const v8::FunctionCallbackInfo<v8::Value>& info, Tagged<HeapObject>* out) {
+  Sandbox* sandbox = GetProcessWideSandbox();
+  v8::Isolate* isolate = info.GetIsolate();
+  Local<v8::Context> context = isolate->GetCurrentContext();
+
+  if (info.Length() == 0) {
+    isolate->ThrowError("First argument must be provided");
+    return false;
+  }
+
+  Local<v8::Uint32> arg1;
+  if (!info[0]->ToUint32(context).ToLocal(&arg1)) {
+    isolate->ThrowError("First argument must be the address of a HeapObject");
+    return false;
+  }
+
+  uint32_t address = arg1->Value();
+  // Allow tagged addresses by removing the kHeapObjectTag and
+  // kWeakHeapObjectTag. This allows clients to just read tagged pointers from
+  // the heap and use them for these APIs.
+  address &= ~kHeapObjectTagMask;
+  *out = HeapObject::FromAddress(sandbox->base() + address);
+  return true;
+}
+
+// Sandbox.getAddressOf(Object) -> Number
+void SandboxGetAddressOf(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  DCHECK(ValidateCallbackInfo(info));
+  v8::Isolate* isolate = info.GetIsolate();
+
+  Tagged<HeapObject> obj;
+  if (!GetArgumentObjectPassedAsReference(info, &obj)) {
     return;
   }
 
   // HeapObjects must be allocated inside the pointer compression cage so their
   // address relative to the start of the sandbox can be obtained simply by
   // taking the lowest 32 bits of the absolute address.
-  uint32_t address = static_cast<uint32_t>(HeapObject::cast(*arg).address());
-  args.GetReturnValue().Set(v8::Integer::NewFromUnsigned(isolate, address));
+  uint32_t address = static_cast<uint32_t>(obj->address());
+  info.GetReturnValue().Set(v8::Integer::NewFromUnsigned(isolate, address));
 }
 
-// Sandbox.getSizeOf(object) -> Number
-void SandboxGetSizeOf(const v8::FunctionCallbackInfo<v8::Value>& args) {
-  v8::Isolate* isolate = args.GetIsolate();
+// Sandbox.getObjectAt(Number) -> Object
+void SandboxGetObjectAt(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  DCHECK(ValidateCallbackInfo(info));
+  v8::Isolate* isolate = info.GetIsolate();
 
-  if (args.Length() == 0) {
-    isolate->ThrowError("First argument must be provided");
+  Tagged<HeapObject> obj;
+  if (!GetArgumentObjectPassedAsAddress(info, &obj)) {
     return;
   }
 
-  Handle<Object> arg = Utils::OpenHandle(*args[0]);
-  if (!arg->IsHeapObject()) {
-    isolate->ThrowError("First argument must be a HeapObject");
+  i::Isolate* i_isolate = reinterpret_cast<Isolate*>(isolate);
+  Handle<Object> handle(obj, i_isolate);
+  info.GetReturnValue().Set(ToApiHandle<v8::Value>(handle));
+}
+
+static void SandboxGetSizeOfImpl(
+    const v8::FunctionCallbackInfo<v8::Value>& info,
+    ArgumentObjectExtractorFunction getArgumentObject) {
+  DCHECK(ValidateCallbackInfo(info));
+  v8::Isolate* isolate = info.GetIsolate();
+
+  Tagged<HeapObject> obj;
+  if (!getArgumentObject(info, &obj)) {
     return;
   }
 
-  int size = HeapObject::cast(*arg).Size();
-  args.GetReturnValue().Set(v8::Integer::New(isolate, size));
+  int size = obj->Size();
+  info.GetReturnValue().Set(v8::Integer::New(isolate, size));
+}
+
+// Sandbox.getSizeOf(Object) -> Number
+void SandboxGetSizeOf(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  SandboxGetSizeOfImpl(info, &GetArgumentObjectPassedAsReference);
+}
+
+// Sandbox.getSizeOfObjectAt(Number) -> Number
+void SandboxGetSizeOfObjectAt(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  SandboxGetSizeOfImpl(info, &GetArgumentObjectPassedAsAddress);
+}
+
+static void SandboxGetInstanceTypeOfImpl(
+    const v8::FunctionCallbackInfo<v8::Value>& info,
+    ArgumentObjectExtractorFunction getArgumentObject) {
+  DCHECK(ValidateCallbackInfo(info));
+  v8::Isolate* isolate = info.GetIsolate();
+
+  Tagged<HeapObject> obj;
+  if (!getArgumentObject(info, &obj)) {
+    return;
+  }
+
+  InstanceType type = obj->map()->instance_type();
+  std::stringstream out;
+  out << type;
+  MaybeLocal<v8::String> result =
+      v8::String::NewFromUtf8(isolate, out.str().c_str());
+  info.GetReturnValue().Set(result.ToLocalChecked());
+}
+
+// Sandbox.getInstanceTypeOfObjectAt(Object) -> String
+void SandboxGetInstanceTypeOf(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  SandboxGetInstanceTypeOfImpl(info, &GetArgumentObjectPassedAsReference);
+}
+
+// Sandbox.getInstanceTypeOfObjectAt(Number) -> String
+void SandboxGetInstanceTypeOfObjectAt(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  SandboxGetInstanceTypeOfImpl(info, &GetArgumentObjectPassedAsAddress);
 }
 
 Handle<FunctionTemplateInfo> NewFunctionTemplate(
@@ -156,7 +255,8 @@ void InstallGetter(Isolate* isolate, Handle<JSObject> object,
   Handle<String> property_name = factory->NewStringFromAsciiChecked(name);
   Handle<JSFunction> getter = CreateFunc(isolate, func, property_name, false);
   Handle<Object> setter = factory->null_value();
-  JSObject::DefineAccessor(object, property_name, getter, setter, FROZEN);
+  JSObject::DefineOwnAccessorIgnoreAttributes(object, property_name, getter,
+                                              setter, FROZEN);
 }
 
 void InstallFunction(Isolate* isolate, Handle<JSObject> holder,
@@ -191,7 +291,14 @@ void SandboxTesting::InstallMemoryCorruptionApi(Isolate* isolate) {
   InstallGetter(isolate, sandbox, SandboxGetByteLength, "byteLength");
   InstallConstructor(isolate, sandbox, SandboxMemoryView, "MemoryView", 2);
   InstallFunction(isolate, sandbox, SandboxGetAddressOf, "getAddressOf", 1);
+  InstallFunction(isolate, sandbox, SandboxGetObjectAt, "getObjectAt", 1);
   InstallFunction(isolate, sandbox, SandboxGetSizeOf, "getSizeOf", 1);
+  InstallFunction(isolate, sandbox, SandboxGetSizeOfObjectAt,
+                  "getSizeOfObjectAt", 1);
+  InstallFunction(isolate, sandbox, SandboxGetInstanceTypeOf,
+                  "getInstanceTypeOf", 1);
+  InstallFunction(isolate, sandbox, SandboxGetInstanceTypeOfObjectAt,
+                  "getInstanceTypeOfObjectAt", 1);
 
   // Install the Sandbox object as property on the global object.
   Handle<JSGlobalObject> global = isolate->global_object();
@@ -226,6 +333,12 @@ void SandboxSignalHandler(int signal, siginfo_t* info, void* void_context) {
     _exit(0);
   }
 
+  if (signal == SIGTRAP) {
+    // Similarly, SIGTRAP probably indicates UNREACHABLE code.
+    PrintToStderr("Caught harmless signal (SIGTRAP). Exiting process...\n");
+    _exit(0);
+  }
+
   Address faultaddr = reinterpret_cast<Address>(info->si_addr);
 
   if (GetProcessWideSandbox()->Contains(faultaddr)) {
@@ -249,14 +362,34 @@ void SandboxSignalHandler(int signal, siginfo_t* info, void* void_context) {
     _exit(0);
   }
 
+  if (faultaddr >= 0x8000'0000'0000'0000ULL) {
+    // On Linux, it appears that the kernel will still report valid (i.e.
+    // canonical) kernel space addresses via the si_addr field, so we need to
+    // handle these separately. We've already filtered out non-canonical
+    // addresses above, so here we can just test if the most-significant bit of
+    // the address is set, and if so assume that it's a kernel address.
+    PrintToStderr(
+        "Caught harmless memory access violatation (kernel space address). "
+        "Exiting process...\n");
+    _exit(0);
+  }
+
   if (faultaddr < 0x1000) {
-    printf("Faultaddr: 0x%lx\n", faultaddr);
     // Nullptr dereferences are harmless as nothing can be mapped there. We use
     // the typical page size (which is also the default value of mmap_min_addr
     // on Linux) to determine what counts as a nullptr dereference here.
     PrintToStderr(
         "Caught harmless memory access violaton (nullptr dereference). Exiting "
         "process...\n");
+    _exit(0);
+  }
+
+  if (faultaddr < 4ULL * GB) {
+    // Currently we also ignore access violations in the first 4GB of the
+    // virtual address space. See crbug.com/1470641 for more details.
+    PrintToStderr(
+        "Caught harmless memory access violaton (first 4GB of virtual address "
+        "space). Exiting process...\n");
     _exit(0);
   }
 
@@ -301,6 +434,7 @@ void SandboxTesting::InstallSandboxCrashFilter() {
 
   bool success = true;
   success &= (sigaction(SIGABRT, &action, nullptr) == 0);
+  success &= (sigaction(SIGTRAP, &action, nullptr) == 0);
   success &= (sigaction(SIGBUS, &action, &g_old_sigbus_handler) == 0);
   success &= (sigaction(SIGSEGV, &action, &g_old_sigsegv_handler) == 0);
   CHECK(success);
